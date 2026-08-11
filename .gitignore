@@ -1,0 +1,47 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Built app bundle (produced by build-app.sh)
+Diskette.app/
+*.app/
+
+# Xcode (if opened as a package)
+DerivedData/
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*~
+.history/
+
+# Logs & crash dumps
+*.log
+*.crash
+
+# Local / temp
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Optional local secrets (none required today)
+.env
+.env.*
+*.pem

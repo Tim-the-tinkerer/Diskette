@@ -1,0 +1,15 @@
+FLOP/1
+label=Demo Disc
+media=3.5-hd-1.44m
+capacity=1474560
+sector=512
+created=2026-08-10T21:36:50Z
+modified=2026-08-10T21:36:50Z
+files=1
+dirs=0
+used=28
+volume_crc=b7b94693
+
+FILE /hello.txt 28 ff26e93b 1786397810
+aGVsbG8gZnJvbSBhIHZpcnR1YWwgZmxvcHB5Cg==
+END
