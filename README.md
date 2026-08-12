@@ -61,6 +61,13 @@ This is **packaging / storage**, not encryption.
 
 **Compress (zlib)** in the sidebar reflects how the mounted disc was last saved (FLOP/2 header flag). Opening an uncompressed disc leaves the toggle off and does not mark the disc dirty. Changing packaging or compress only prompts Save when you actually change them.
 
+### Damage recovery (format notes)
+
+- If the directory still loads, extract normally; **CRC-32** shows which files are intact.
+- A broken header may still leave **uncompressed** payloads carvable by type signatures; **zlib** records need directory metadata for boundaries.
+- Span restore needs intact manifests; a **missing disc** cannot be rebuilt (no parity / PAR2 in the format today).
+- Details: [FORMAT.md — Damage recovery](FORMAT.md#damage-recovery).
+
 ## Build & run
 
 ```bash

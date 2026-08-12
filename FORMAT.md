@@ -162,6 +162,35 @@ END
 5. **Paths** use `/`-separated components. `Volume.join` sanitizes each component but keeps nested segments (so `join("/Root", "Film Hiss/a.txt")` → `/Root/Film Hiss/a.txt`).  
 6. **Layout repair (opt-in, 1.5.7+ behavior):** a short-lived join bug wrote `D-rest` beside directory `D` instead of `D/rest`. **`--repair-layout`** and the UI **Repair Layout…** command apply a heuristic that moves such siblings. Open and extract **do not** rewrite paths (1.5.7+): a filename pattern alone is not safe provenance — e.g. legitimate `Reports-summary.txt` next to `Reports/` would also match.
 
+## Damage recovery
+
+The app does not include a forensic carver. The notes below describe what the format makes possible if a container is partially damaged.
+
+### Directory metadata still readable
+
+If the FLOP/1 or FLOP/2 directory remains intact enough to parse:
+
+- Extraction is straightforward (`--extract` / browser **Extract…**).
+- Per-file **CRC-32** shows exactly which payloads match; mismatches mean that file’s bytes are corrupt even if the path still appears.
+
+### Damaged header / unreadable directory
+
+If the volume header or entry table is damaged so the container no longer loads:
+
+- **Uncompressed** stored blobs may sometimes be **carved** from the raw file using recognizable signatures, e.g. `%PDF`, TIFF `II*\0` / `MM\0*`, MP4 `ftyp`, ZIP `PK`.
+- **Compressed** (zlib) records are harder: boundaries depend on the path, stored length, and compression flag in the directory — without that metadata, carving is unreliable.
+- CRC-32 **detects** corruption; it **cannot repair** it.
+
+### Span sets
+
+- A damaged or missing `/.diskette-span/manifest.json` blocks normal **Restore Set…** (the set depends on matching manifests across discs).
+- Internal numbered part paths under `/.diskette-span/parts/<fileKey>/<NNNN>.part` may still provide clues for manual reassembly if those blobs survive.
+- A **missing or badly damaged disc** in a multi-disc set cannot be reconstructed from the remaining discs alone: the format has no parity or redundant payload blocks.
+
+### Not in the format today
+
+There is **no** parity, Reed–Solomon, or PAR2-style recovery data inside `.Floppy` containers. True recovery from a lost disc would be a **separate feature** (external recovery volumes or optional redundant blocks), not something current discs provide.
+
 ## Opening files from the disc (app)
 
 Payload bytes are written to a read-only temp path under the system temporary directory (`DisketteOpen/<volume-id>/…`), then:
