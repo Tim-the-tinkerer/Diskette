@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.6.0 — 2026-08-12
+
+- **Reed–Solomon recovery discs (multi-loss)**
+  - Span can write **N** recovery discs (`--recovery-discs N` or UI menu)
+  - **N = 1:** XOR parity (same as 1.5.9) — rebuild any **one** lost data disc
+  - **N ≥ 2:** Cauchy Reed–Solomon over GF(256) — rebuild up to **N** lost data discs
+  - Filenames: `stem-Recovery-01ofN.Floppy` … `stem-Recovery-NofN.Floppy`
+  - Magic `DISKETTE-SPAN-RECOVERY/2` + scheme `reed-solomon` (v1 XOR discs still restore)
+  - **Recover Missing Disc…** / `--recover-disc` rebuild all currently missing discs (within N)
+  - Not full PAR2 multi-erasure for arbitrary files; span-set disc images only
+
+## 1.5.9 — 2026-08-11
+
+- **Optional span recovery disc (single-loss XOR)**
+  - Span option: create `stem-Recovery-01of01.Floppy` with XOR parity of all data disc files
+  - Rebuild **any one** missing data disc: \(D_k = P \oplus \bigoplus_{i \neq k} D_i\)
+  - UI: checkbox on Span Folder…; **Recover Missing Disc…**
+  - CLI: `--span … --with-recovery`; `--recover-disc RECOVERY.Floppy DATA… -o OUT`
+  - Does not protect against two losses; not PAR2 multi-erasure
+
 ## 1.5.8 — 2026-08-11
 
 - **Span dense folders (manifest overflow)**

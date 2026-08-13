@@ -185,11 +185,12 @@ If the volume header or entry table is damaged so the container no longer loads:
 
 - A damaged or missing `/.diskette-span/manifest.json` blocks normal **Restore Set…** (the set depends on matching manifests across discs).
 - Internal numbered part paths under `/.diskette-span/parts/<fileKey>/<NNNN>.part` may still provide clues for manual reassembly if those blobs survive.
-- A **missing or badly damaged disc** in a multi-disc set cannot be reconstructed from the remaining discs alone: the format has no parity or redundant payload blocks.
+- Without recovery discs, a **missing data disc** cannot be reconstructed from the remaining discs alone.
+- With optional recovery discs (see below): **1× XOR** rebuilds any one loss; **N× Reed–Solomon** rebuilds up to N losses.
 
-### Not in the format today
+### Not on individual data discs
 
-There is **no** parity, Reed–Solomon, or PAR2-style recovery data inside `.Floppy` containers. True recovery from a lost disc would be a **separate feature** (external recovery volumes or optional redundant blocks), not something current discs provide.
+Data discs do **not** embed parity inside themselves. Redundancy is only in the separate optional recovery volumes created at span time.
 
 ## Opening files from the disc (app)
 
@@ -210,6 +211,8 @@ Edits in external apps do **not** update the volume unless the user re-adds. Tem
 | `--extract` | Load → write host file/tree |
 | `--info` | Load → volume summary + on-disk / estimate sizes |
 | `--repack` | Load → rewrite with chosen packaging |
+| `--span … --with-recovery` / `--recovery-discs N` | Pack set + 1 XOR or N Reed–Solomon recovery discs |
+| `--recover-disc` | Rebuild missing data disc(s) from recovery + survivors |
 
 ## Multi-disc span
 
@@ -266,6 +269,59 @@ Whole files only; no `parts` array. Restore synthesizes a single part per `files
 
 Filenames: `Label-01of03.Floppy` (zero-padded).
 
+### Optional recovery discs
+
+Opt-in at span time (UI: recovery count; CLI `--with-recovery` / `--recovery-discs N`). Not created by default.
+
+#### One recovery disc — XOR (`DISKETTE-SPAN-RECOVERY/1`)
+
+```
+Label-01of33.Floppy … Label-33of33.Floppy
+Label-Recovery-01of01.Floppy
+```
+
+XOR of equal-sized blocks of the **raw on-disk** data `.Floppy` files (zero-padded to the longest):
+
+\[
+P = D_1 \oplus D_2 \oplus \cdots \oplus D_n
+\]
+
+Any **one** missing data disc: \(D_k = P \oplus \bigoplus_{i \neq k} D_i\).
+
+#### N recovery discs — Cauchy Reed–Solomon (`DISKETTE-SPAN-RECOVERY/2`)
+
+```
+Label-01of33.Floppy … Label-33of33.Floppy
+Label-Recovery-01of03.Floppy
+Label-Recovery-02of03.Floppy
+Label-Recovery-03of03.Floppy
+```
+
+For each byte offset, the n data symbols and m parity symbols form a systematic Cauchy RS codeword over **GF(256)** (AES polynomial 0x11d):
+
+\[
+P_j = \bigoplus_{i=1}^{n} C_{j,i}\cdot D_i
+\quad\text{where}\quad
+C_{j,i} = \frac{1}{x_i \oplus y_j}
+\]
+
+- Rebuilds **any m** missing data discs when the other data discs and enough recovery discs remain.
+- Which discs were lost does not matter (up to m losses).
+- More than m losses cannot be recovered this way.
+
+**Paths on each recovery volume**
+
+| Path | Content |
+|------|---------|
+| `/.diskette-span/recovery/manifest.json` | Recovery metadata |
+| `/.diskette-span/recovery/parity.bin` | Parity block (length = max data-disc file size) |
+
+**Manifest fields:** `magic`, `scheme` (`xor` \| `reed-solomon`), `setId`, `setLabel`, `media`, `discCount`, `recoveryCount`, `recoveryIndex`, `recoveryDiscFilenames[]`, `parityByteLength`, `dataDiscFilenames[]`, `dataDiscByteLengths[]`, `dataDiscCrc32[]`, `parityCrc32`, `allParityCrc32[]`, `created`.
+
+Media for each recovery volume is the **smallest** classic capacity that fits parity + manifest. Parity is stored **without** zlib.
+
+CLI: `--recover-disc ~/Discs -o ~/Discs` (folder of survivors + recovery discs).
+
 ## App version
 
 | App | Notes |
@@ -286,3 +342,5 @@ Filenames: `Label-01of03.Floppy` (zero-padded).
 | 1.5.6 | Truncated Span complete disc list for large multi-disc sets |
 | 1.5.7 | Layout repair opt-in only (no auto on open/extract); UI Repair Layout… |
 | 1.5.8 | Span planner reserves per-part manifest space (dense small-file trees) |
+| 1.5.9 | Optional XOR recovery disc; recover any one missing span data disc |
+| 1.6.0 | Reed–Solomon recovery discs (multi-loss); recovery count UI/CLI |

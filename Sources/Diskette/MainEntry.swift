@@ -31,8 +31,10 @@ struct MainEntry {
                   Diskette --repack FILE.Floppy [-o OUT] [--format binary|text] [--no-compress]
                   Diskette --repair-layout FILE.Floppy   Opt-in: Film Hiss-file → Film Hiss/file (heuristic; see docs)
                   Diskette --span FOLDER -o OUTDIR [--media SIZE] [--label NAME] [--format binary|text] [--no-compress]
+                           [--with-recovery | --recovery-discs N]
                   Diskette --unspan DISC1.Floppy [DISC2…] -o OUTDIR [--force|--skip-existing]
                   Diskette --unspan-dir DIR -o OUTDIR [--force|--skip-existing]
+                  Diskette --recover-disc [RECOVERY…|DIR…] -o OUTDIR
 
                 Media:
                   360 | 720 | 1.2 | 1.44 (default) | 2.88
@@ -45,6 +47,9 @@ struct MainEntry {
                 Span (multi-disc sets):
                   Pack a folder across multiple .Floppy discs (streams; not all in RAM).
                   Oversized files are chunked. Hidden files are skipped. Empty dirs kept.
+                  --with-recovery / --recovery-discs 1 → XOR disc (rebuild any ONE lost data disc).
+                  --recovery-discs N (N≥2) → N Reed–Solomon recovery discs (rebuild up to N losses).
+                  --recover-disc rebuilds missing data discs from recovery + survivors.
                   Restore default refuses an existing destination root; --force overwrites.
 
                 Containers open inside the app — multi-file browse/add/extract.
@@ -62,6 +67,9 @@ struct MainEntry {
         }
         if args.contains("--span") {
             cliSpan(args)
+        }
+        if args.contains("--recover-disc") {
+            cliRecoverDisc(args)
         }
         if args.contains("--unspan-dir") {
             cliUnspanDir(args)
@@ -89,6 +97,7 @@ struct MainEntry {
         let flagsWithValue: Set<String> = [
             "--encode", "--decode", "--create", "--list", "--add", "--extract",
             "--info", "--repack", "--repair-layout", "--span", "--unspan", "--unspan-dir",
+            "--recover-disc", "--recovery-discs",
             "-o", "--media", "--label", "--format", "--path", "--dialect",
         ]
         var i = 1
@@ -237,6 +246,16 @@ struct MainEntry {
             packaging = parsePackaging(args[fi + 1])
         }
         if args.contains("--no-compress") { compress = false }
+        var recoveryDiscCount = 0
+        if args.contains("--with-recovery") { recoveryDiscCount = max(recoveryDiscCount, 1) }
+        if let ri = args.firstIndex(of: "--recovery-discs"), ri + 1 < args.count {
+            recoveryDiscCount = max(0, Int(args[ri + 1]) ?? 0)
+        }
+        // Also accept --with-recovery=N
+        if let eq = args.first(where: { $0.hasPrefix("--with-recovery=") }) {
+            let n = Int(eq.split(separator: "=").last.map(String.init) ?? "") ?? 1
+            recoveryDiscCount = max(recoveryDiscCount, n)
+        }
 
         do {
             let result = try SpanSet.spanFolder(
@@ -245,19 +264,79 @@ struct MainEntry {
                 media: media,
                 setLabel: label,
                 packaging: packaging,
-                compress: compress
+                compress: compress,
+                recoveryDiscCount: recoveryDiscCount
             )
             print(
                 "spanned files=\(result.totalFiles) bytes=\(result.totalBytes) "
                     + "chunked=\(result.chunkedFiles) emptyDirs=\(result.emptyDirectories) "
                     + "discs=\(result.discURLs.count) media=\(result.media.shortName) set=\(result.setId)"
+                    + (result.recoveryURLs.isEmpty ? "" : " recovery=\(result.recoveryURLs.count)")
             )
             for url in result.discURLs {
                 print("  → \(url.path)")
             }
+            for rec in result.recoveryURLs {
+                print("  recovery → \(rec.path)")
+            }
             exit(0)
         } catch {
             fputs("span error: \(error.localizedDescription)\n", stderr)
+            exit(1)
+        }
+    }
+
+    private static func cliRecoverDisc(_ args: [String]) {
+        guard let idx = args.firstIndex(of: "--recover-disc") else {
+            fputs("usage: Diskette --recover-disc RECOVERY… [DATA…] -o OUTDIR\n", stderr)
+            exit(1)
+        }
+        guard let oi = args.firstIndex(of: "-o"), oi + 1 < args.count else {
+            fputs("recover-disc requires -o OUTDIR\n", stderr)
+            exit(1)
+        }
+        let out = URL(fileURLWithPath: args[oi + 1])
+        var available: [URL] = []
+        var i = idx + 1
+        while i < args.count {
+            let a = args[i]
+            if a == "-o" { break }
+            if a.hasPrefix("--") { break }
+            let url = URL(fileURLWithPath: a)
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                if let kids = try? FileManager.default.contentsOfDirectory(
+                    at: url,
+                    includingPropertiesForKeys: nil
+                ) {
+                    available.append(contentsOf: kids.filter { DisketteEngine.isFloppyFilename($0) })
+                }
+            } else {
+                available.append(url)
+            }
+            i += 1
+        }
+        guard !available.isEmpty else {
+            fputs("recover-disc: pass recovery + data discs, or a folder containing them\n", stderr)
+            exit(1)
+        }
+        do {
+            let batch = try SpanSet.reconstructMissingDiscs(
+                availableDiscURLs: available,
+                outputURL: out
+            )
+            print(
+                "recovered \(batch.results.count) disc(s) scheme=\(batch.scheme.rawValue) set=\(batch.setId)"
+            )
+            for result in batch.results {
+                print(
+                    "  disc \(result.missingIndex) \(result.missingFilename) "
+                        + "(\(result.byteLength) B) → \(result.reconstructedURL.path)"
+                )
+            }
+            exit(0)
+        } catch {
+            fputs("recover-disc error: \(error.localizedDescription)\n", stderr)
             exit(1)
         }
     }
@@ -626,6 +705,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Open .Floppy discs inside the app — browse,
                 add, extract. Span large folders across multiple
                 discs; oversize files are chunked and rejoined.
+                Optional recovery discs: 1× XOR or N× Reed–Solomon.
                 Double-click a file to open it in the default app.
                 FLOP/2 binary (default) + zlib; FLOP/1 text legacy.
                 CRC-32 integrity. Packaging only — not encryption.

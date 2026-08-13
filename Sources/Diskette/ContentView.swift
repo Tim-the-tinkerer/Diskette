@@ -164,6 +164,13 @@ struct ContentView: View {
                     }
                     .help("Reassemble a multi-disc span set into a folder")
 
+                    Button {
+                        recoverMissingDisc()
+                    } label: {
+                        Label("Recover Missing Disc…", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .help("Rebuild lost data disc(s) using Recovery disc(s) — XOR (1) or Reed–Solomon (2+)")
+
                     if session.volume != nil {
                         Button {
                             repairLayoutOnMountedDisc()
@@ -220,7 +227,7 @@ struct ContentView: View {
             }
             return "Create or open a .Floppy container — browse it here, no mount required"
         case .format:
-            return "FLOP/2 binary (default) · FLOP/1 text legacy — multi-file containers"
+            return "FLOP/2 binary · multi-disc span · XOR / Reed–Solomon recovery · CRC integrity"
         }
     }
 
@@ -440,15 +447,28 @@ struct ContentView: View {
                 GroupBox("FLOP packaging") {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Default save: FLOP/2 binary (raw payloads + optional zlib) — no base64 overhead.")
-                        Text("Legacy: FLOP/1 text (UTF-8 + base64) still opens; Save upgrades to binary.")
+                        Text("Legacy: FLOP/1 text (UTF-8 + base64) still opens; Save can keep text or upgrade to binary.")
                         Text("Extension: .\(DisketteEngine.fileExtension) · Magics: FLP2 · \(DisketteEngine.magic)")
                             .font(.body.monospaced())
-                        Text("Logical capacity is file bytes on the disc; container file size depends on packaging.")
+                        Text("Logical capacity counts uncompressed file bytes; on-disk size depends on packaging and zlib.")
+                            .foregroundStyle(.secondary)
+                        Text("Sidebar Compress reflects the mounted disc’s FLOP/2 header (not a silent default).")
                             .foregroundStyle(.secondary)
                         Text("Not encryption — multi-file storage with classic capacity limits and CRC-32.")
                             .foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(4)
+                }
+
+                GroupBox("Integrity") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        labeledRow("File CRC", "CRC-32 of each logical (uncompressed) payload")
+                        labeledRow("Volume", "volume_crc over the sorted directory digest; verified on load")
+                        labeledRow("Span", "Part CRC + full-file CRC when chunking; checked on restore")
+                        labeledRow("Damage", "CRC detects corruption; it does not repair. No parity inside a single data disc.")
+                        labeledRow("Layout", "Repair Layout… / --repair-layout is opt-in only (join-bug heuristic)")
+                    }
                     .padding(4)
                 }
 
@@ -473,19 +493,50 @@ struct ContentView: View {
                     .padding(4)
                 }
 
+                GroupBox("Multi-disc span") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        labeledRow("Span", "Span Folder… packs a host folder across numbered .Floppy discs")
+                        labeledRow("Chunking", "Files larger than one disc split under /.diskette-span/parts/")
+                        labeledRow("Manifest", "/.diskette-span/manifest.json on every data disc (DISKETTE-SPAN/2)")
+                        labeledRow("Streaming", "Host files CRC’d and sliced from disk — not all held in RAM")
+                        labeledRow("Hidden", "Host dotfiles skipped; empty directories preserved")
+                        labeledRow("Restore", "Restore Set… needs a complete set; collision fail / overwrite / skip")
+                        labeledRow("Warning", "Do not delete or rename /.diskette-span on a span disc")
+                    }
+                    .padding(4)
+                }
+
+                GroupBox("Recovery discs (optional)") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        labeledRow("Create", "Span dialog: None · 1 XOR · 2–8 Reed–Solomon")
+                        labeledRow("XOR (1)", "stem-Recovery-01of01.Floppy — rebuild any one lost data disc")
+                        labeledRow("RS (N)", "stem-Recovery-JJofNN.Floppy — rebuild up to N lost data discs")
+                        labeledRow("Coding", "XOR of disc images, or Cauchy RS over GF(256) on equal-sized blocks")
+                        labeledRow("Recover", "Recover Missing Disc… with recovery disc(s) + survivors")
+                        labeledRow("Limit", "Protects against at most N losses; not full PAR2 for arbitrary files")
+                        Text("Paths: /.diskette-span/recovery/manifest.json · parity.bin")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 2)
+                    }
+                    .padding(4)
+                }
+
                 GroupBox("In-app drive") {
                     VStack(alignment: .leading, spacing: 6) {
-                        labeledRow("Open disc", "Double-click a .Floppy or use Open… — the disc mounts in Diskette")
-                        labeledRow("Browse", "Folder navigation; double-click folders to enter")
+                        labeledRow("Open disc", "Double-click a .Floppy, Open…, or drop a disc — mounts in Diskette")
+                        labeledRow("Browse", "Folder navigation; multi-select; double-click folders to enter")
                         labeledRow("Open file", "Double-click a file → default macOS app (temp read-only copy)")
                         labeledRow("Quick Look", "Toolbar eye or context menu — system QLPreviewPanel")
                         labeledRow("Drop in", "Drop .Floppy to open; drop files/folders onto a mounted disc to add")
                         labeledRow("Drag out", "Drag the ⋮⋮ handle to Finder (multi-select exports a folder)")
-                        labeledRow("Add", "Add… button or drop from Finder")
-                        labeledRow("Extract", "Copy selected items back to your Mac")
-                        labeledRow("Span", "Span Folder… — multi-disc; chunks + streaming; skips hidden files")
+                        labeledRow("Add", "Add… button or drop from Finder (folder trees preserved)")
+                        labeledRow("Extract", "Copy selected items back to the Mac (structure preserved)")
+                        labeledRow("Repair", "Repair Layout… — opt-in join-bug fix; Save to persist")
+                        labeledRow("Span", "Span Folder… — multi-disc; chunks + streaming; optional recovery")
+                        labeledRow("Recover", "Recover Missing Disc… — XOR / Reed–Solomon rebuild")
                         labeledRow("Restore", "Restore Set… — merge discs, rejoin chunks; collision prompt")
-                        labeledRow("Save", "Write the .Floppy container (Save / Save As)")
+                        labeledRow("Save", "Write the .Floppy container (Save / Save As); prompted if dirty")
                     }
                     .padding(4)
                 }
@@ -498,9 +549,26 @@ struct ContentView: View {
                         Diskette --list disc.Floppy
                         Diskette --add disc.Floppy ./photo.png --path /photo.png
                         Diskette --extract disc.Floppy /photo.png -o ./out
+                        Diskette --repair-layout disc.Floppy
+                        Diskette --span ./BigFolder -o ~/Discs --media 1.44 --recovery-discs 3
+                        Diskette --recover-disc ~/Discs -o ~/Discs
+                        Diskette --unspan-dir ~/Discs -o ~/Restored
                         """
                     )
                     .font(.system(.caption, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(4)
+                }
+
+                GroupBox("Reference") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Full on-disk layout, span manifests, and recovery math: FORMAT.md in the project.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text("App \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?") · macOS 13+")
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.tertiary)
+                    }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(4)
                 }
@@ -513,7 +581,7 @@ struct ContentView: View {
         HStack(alignment: .top, spacing: 10) {
             Text(title)
                 .font(.caption.weight(.semibold))
-                .frame(width: 64, alignment: .leading)
+                .frame(width: 72, alignment: .leading)
                 .foregroundStyle(AppTheme.accent)
             Text(body)
                 .font(.caption)
@@ -531,7 +599,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             } else {
-                Text("FLOP/2 binary · virtual floppies open in-app")
+                Text("FLOP/2 · span · XOR/RS recovery · open in-app")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             }
@@ -630,7 +698,8 @@ struct ContentView: View {
             "Large folders use multiple discs; oversized files are chunked. "
             + "Hidden files (dotfiles) are skipped. Empty folders are preserved. "
             + "Source data is streamed (not all loaded into memory)."
-        let pop = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 280, height: 24), pullsDown: false)
+        let accessory = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 86))
+        let pop = NSPopUpButton(frame: NSRect(x: 0, y: 56, width: 360, height: 24), pullsDown: false)
         for m in DisketteEngine.Media.allCases {
             pop.addItem(withTitle: "\(m.displayName) — \(DisketteEngine.formatBytes(m.capacity))")
             pop.lastItem?.representedObject = m.rawValue
@@ -638,12 +707,35 @@ struct ContentView: View {
         if let idx = DisketteEngine.Media.allCases.firstIndex(of: newMedia) {
             pop.selectItem(at: idx)
         }
-        mediaAlert.accessoryView = pop
+        let recoveryLabel = NSTextField(labelWithString: "Recovery discs:")
+        recoveryLabel.frame = NSRect(x: 0, y: 28, width: 110, height: 22)
+        let recoveryPop = NSPopUpButton(frame: NSRect(x: 112, y: 26, width: 248, height: 24), pullsDown: false)
+        recoveryPop.addItem(withTitle: "None")
+        recoveryPop.lastItem?.tag = 0
+        recoveryPop.addItem(withTitle: "1 — XOR (rebuild any 1 lost disc)")
+        recoveryPop.lastItem?.tag = 1
+        for n in 2...min(8, SpanSet.maxRecoveryDiscs) {
+            recoveryPop.addItem(withTitle: "\(n) — Reed–Solomon (rebuild up to \(n) losses)")
+            recoveryPop.lastItem?.tag = n
+        }
+        recoveryPop.selectItem(at: 0)
+        let recoveryHint = NSTextField(
+            wrappingLabelWithString: "Recovery discs are extra floppies kept with the set."
+        )
+        recoveryHint.frame = NSRect(x: 0, y: 2, width: 360, height: 22)
+        recoveryHint.font = NSFont.systemFont(ofSize: 11)
+        recoveryHint.textColor = .secondaryLabelColor
+        accessory.addSubview(pop)
+        accessory.addSubview(recoveryLabel)
+        accessory.addSubview(recoveryPop)
+        accessory.addSubview(recoveryHint)
+        mediaAlert.accessoryView = accessory
         mediaAlert.addButton(withTitle: "Continue")
         mediaAlert.addButton(withTitle: "Cancel")
         guard mediaAlert.runModal() == .alertFirstButtonReturn else { return }
         let mediaRaw = (pop.selectedItem?.representedObject as? String) ?? DisketteEngine.Media.default.rawValue
         let media = DisketteEngine.Media.parse(mediaRaw) ?? .default
+        let recoveryDiscCount = recoveryPop.selectedItem?.tag ?? 0
 
         let save = makeFolderPicker(
             message: "Choose output folder for span discs (\(media.shortName))",
@@ -659,25 +751,40 @@ struct ContentView: View {
                 media: media,
                 setLabel: folder.lastPathComponent,
                 packaging: .binary,
-                compress: true
+                compress: true,
+                recoveryDiscCount: recoveryDiscCount
             )
             let chunkNote = result.chunkedFiles > 0 ? " · \(result.chunkedFiles) chunked" : ""
+            let recNote = result.recoveryURLs.isEmpty
+                ? ""
+                : " + \(result.recoveryURLs.count) recovery"
             statusMessage =
                 "Spanned \(result.totalFiles) files (\(DisketteEngine.formatBytes(result.totalBytes)))"
-                + "\(chunkNote) → \(result.discURLs.count) disc(s) in \(outDir.lastPathComponent)"
+                + "\(chunkNote) → \(result.discURLs.count) disc(s)\(recNote) in \(outDir.lastPathComponent)"
             // Mount first disc for inspection
             if let first = result.discURLs.first {
                 openURL(first)
             }
             let note = NSAlert()
             note.messageText = "Span complete"
-            let names = result.discURLs.map(\.lastPathComponent)
-            note.informativeText =
-                "Created \(result.discURLs.count) disc(s)"
+            var names = result.discURLs.map(\.lastPathComponent)
+            names.append(contentsOf: result.recoveryURLs.map(\.lastPathComponent))
+            var body =
+                "Created \(result.discURLs.count) data disc(s)"
                 + (result.chunkedFiles > 0 ? " (\(result.chunkedFiles) file(s) split across discs)" : "")
                 + " in \(outDir.lastPathComponent):\n\n"
                 + Self.truncatedNameList(names, limit: 8)
-                + "\n\nUse Restore Set… and select all discs to reassemble."
+            if result.recoveryURLs.count == 1 {
+                body +=
+                    "\n\nXOR recovery disc can rebuild any one missing data disc "
+                    + "(Recover Missing Disc…)."
+            } else if result.recoveryURLs.count > 1 {
+                body +=
+                    "\n\n\(result.recoveryURLs.count) Reed–Solomon recovery discs can rebuild up to "
+                    + "\(result.recoveryURLs.count) missing data discs (Recover Missing Disc…)."
+            }
+            body += "\n\nUse Restore Set… and select all data discs to reassemble."
+            note.informativeText = body
             note.alertStyle = .informational
             note.addButton(withTitle: "OK")
             note.runModal()
@@ -702,6 +809,81 @@ struct ContentView: View {
         let last = names.last!
         let omitted = names.count - headCount - 1
         return (Array(head) + ["… and \(omitted) more …", last]).joined(separator: "\n")
+    }
+
+    /// Rebuild missing span data disc(s) from XOR / Reed–Solomon recovery disc(s).
+    private func recoverMissingDisc() {
+        let open = NSOpenPanel()
+        open.allowedContentTypes = DisketteEngine.importContentTypes
+        open.allowsMultipleSelection = true
+        open.canChooseDirectories = true
+        open.canChooseFiles = true
+        open.message =
+            "Select Recovery disc(s) and remaining data discs (or a folder containing them)"
+        open.prompt = "Recover"
+        guard open.runModal() == .OK, !open.urls.isEmpty else { return }
+
+        var candidates: [URL] = []
+        for url in open.urls {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                if let kids = try? FileManager.default.contentsOfDirectory(
+                    at: url,
+                    includingPropertiesForKeys: nil
+                ) {
+                    candidates.append(contentsOf: kids.filter { DisketteEngine.isFloppyFilename($0) })
+                }
+            } else if DisketteEngine.isFloppyFilename(url) {
+                candidates.append(url)
+            }
+        }
+        candidates = Array(Set(candidates.map(\.standardizedFileURL)))
+
+        let hasRecovery = candidates.contains { url in
+            if let vol = try? DisketteEngine.load(from: url) {
+                return SpanSet.isRecoveryVolume(vol)
+            }
+            return false
+        }
+        guard hasRecovery else {
+            statusMessage = "No Recovery disc found (need *-Recovery-…Floppy)"
+            NSSound.beep()
+            return
+        }
+
+        let save = makeFolderPicker(
+            message: "Choose folder for reconstructed data disc(s)",
+            prompt: "Save Rebuilt Discs Here",
+            canCreate: true
+        )
+        guard save.runModal() == .OK, let outDir = save.url else { return }
+
+        do {
+            let batch = try SpanSet.reconstructMissingDiscs(
+                availableDiscURLs: candidates,
+                outputURL: outDir
+            )
+            let names = batch.results.map(\.missingFilename).joined(separator: ", ")
+            statusMessage =
+                "Recovered \(batch.results.count) disc(s) [\(batch.scheme.rawValue)]: \(names)"
+            NSWorkspace.shared.activateFileViewerSelecting(batch.results.map(\.reconstructedURL))
+            let note = NSAlert()
+            note.messageText = batch.results.count == 1 ? "Disc recovered" : "Discs recovered"
+            let list = batch.results.map {
+                "• \($0.missingFilename) (disc \($0.missingIndex), \(DisketteEngine.formatBytes($0.byteLength)))"
+            }.joined(separator: "\n")
+            note.informativeText =
+                "Scheme: \(batch.scheme.rawValue)\n\n\(list)\n\n"
+                + "Add rebuilt disc(s) back to the set, then use Restore Set… with all data discs."
+            note.alertStyle = .informational
+            note.addButton(withTitle: "OK")
+            note.runModal()
+        } catch {
+            statusMessage = "Recover failed: \(error.localizedDescription)"
+            NSSound.beep()
+            let alert = NSAlert(error: error)
+            alert.runModal()
+        }
     }
 
     /// Restore a multi-disc span set to a host folder.

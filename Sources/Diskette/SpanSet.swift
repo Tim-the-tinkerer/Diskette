@@ -16,6 +16,15 @@ enum SpanSet {
     static let magicV1 = "DISKETTE-SPAN/1"
     static let magicV2 = "DISKETTE-SPAN/2"
     static let magic = magicV2
+    /// Single-loss XOR recovery disc (legacy / m = 1).
+    static let recoveryMagicV1 = "DISKETTE-SPAN-RECOVERY/1"
+    /// Multi-loss Cauchy Reed–Solomon recovery discs (m ≥ 1, preferred for m ≥ 2).
+    static let recoveryMagicV2 = "DISKETTE-SPAN-RECOVERY/2"
+    static let recoveryMagic = recoveryMagicV1
+    static let recoveryManifestPath = "/.diskette-span/recovery/manifest.json"
+    static let recoveryParityPath = "/.diskette-span/recovery/parity.bin"
+    /// Max optional recovery discs (Reed–Solomon parity count).
+    static let maxRecoveryDiscs = CauchyReedSolomon.maxParityShards
     /// Floor headroom for span system folder + small manifests (planning adds per-part JSON cost).
     static let reservedBytes = 8_192
     /// Prefer opening a new disc rather than a sub-512 B sliver before a multi-chunk file.
@@ -106,11 +115,80 @@ enum SpanSet {
     struct SpanResult {
         var setId: String
         var discURLs: [URL]
+        /// Data discs only (excludes optional recovery disc).
+        var dataDiscURLs: [URL] { discURLs }
         var totalFiles: Int
         var totalBytes: Int
         var chunkedFiles: Int
         var emptyDirectories: Int
         var media: DisketteEngine.Media
+        /// First recovery disc URL (XOR or RS-01), if any.
+        var recoveryURL: URL? { recoveryURLs.first }
+        /// Optional recovery disc(s): 1× XOR or m× Reed–Solomon parity.
+        var recoveryURLs: [URL]
+    }
+
+    /// Coding scheme for optional recovery discs.
+    enum RecoveryScheme: String, Codable, Equatable {
+        case xor
+        case reedSolomon = "reed-solomon"
+    }
+
+    /// Manifest stored on each optional recovery disc.
+    struct RecoveryManifest: Codable, Equatable {
+        var magic: String
+        var setId: String
+        var setLabel: String
+        /// Media used for the data discs in the set.
+        var media: String
+        /// Number of data discs in the set.
+        var discCount: Int
+        var parityByteLength: Int
+        /// Filenames of data discs in index order (`stem-01ofN.Floppy` …).
+        var dataDiscFilenames: [String]
+        /// On-disk byte length of each data disc file (before zero-pad).
+        var dataDiscByteLengths: [Int]
+        /// CRC-32 of each full data disc file (verifies rebuild).
+        var dataDiscCrc32: [UInt32]
+        /// CRC-32 of **this** disc’s parity payload.
+        var parityCrc32: UInt32
+        var created: String
+        /// `xor` (v1) or `reed-solomon` (v2). Default xor when absent.
+        var scheme: String?
+        /// Total recovery discs in the set (default 1).
+        var recoveryCount: Int?
+        /// 1-based index of this recovery disc among recovery discs (default 1).
+        var recoveryIndex: Int?
+        /// Filenames of all recovery discs in order.
+        var recoveryDiscFilenames: [String]?
+        /// CRC of every recovery parity payload (same on each disc).
+        var allParityCrc32: [UInt32]?
+
+        var isValidMagic: Bool {
+            magic == SpanSet.recoveryMagicV1 || magic == SpanSet.recoveryMagicV2
+        }
+
+        var resolvedScheme: RecoveryScheme {
+            if let scheme, let s = RecoveryScheme(rawValue: scheme) { return s }
+            return magic == SpanSet.recoveryMagicV2 ? .reedSolomon : .xor
+        }
+
+        var resolvedRecoveryCount: Int { max(1, recoveryCount ?? 1) }
+        var resolvedRecoveryIndex: Int { max(1, recoveryIndex ?? 1) }
+    }
+
+    struct RecoverResult {
+        var setId: String
+        var reconstructedURL: URL
+        var missingIndex: Int
+        var missingFilename: String
+        var byteLength: Int
+    }
+
+    struct RecoverBatchResult {
+        var setId: String
+        var scheme: RecoveryScheme
+        var results: [RecoverResult]
     }
 
     struct UnspanResult {
@@ -151,6 +229,9 @@ enum SpanSet {
         case partCRCMismatch(path: String, part: Int)
         case destinationExists(String)
         case crcOrRead(String)
+        case notARecoveryDisc(String)
+        case recoveryAmbiguous(String)
+        case recoveryFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -171,6 +252,9 @@ enum SpanSet {
             case .partCRCMismatch(let path, let part): return "Chunk CRC mismatch: \(path) part \(part)"
             case .destinationExists(let p): return "Destination already exists: \(p)"
             case .crcOrRead(let m): return m
+            case .notARecoveryDisc(let p): return "Not a span recovery disc: \(p)"
+            case .recoveryAmbiguous(let m): return m
+            case .recoveryFailed(let m): return m
             }
         }
     }
@@ -487,8 +571,14 @@ enum SpanSet {
         media: DisketteEngine.Media = .default,
         setLabel: String? = nil,
         packaging: DisketteEngine.Packaging = .default,
-        compress: Bool = true
+        compress: Bool = true,
+        /// `0` = none; `1` = single XOR recovery disc; `2…` = Reed–Solomon recovery discs.
+        recoveryDiscCount: Int = 0,
+        withRecovery: Bool = false
     ) throws -> SpanResult {
+        let recoveryCount = withRecovery && recoveryDiscCount == 0
+            ? 1
+            : min(max(0, recoveryDiscCount), maxRecoveryDiscs)
         let (rootName, files, emptyDirs) = try enumerateFolder(at: folderURL)
         let label = (setLabel?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
             ?? rootName
@@ -594,6 +684,34 @@ enum SpanSet {
                 discURLs.append(url)
                 writtenURLs.append(url)
             }
+
+            var recoveryURLs: [URL] = []
+            if recoveryCount > 0 {
+                let recs = try writeRecoveryDiscs(
+                    dataDiscURLs: discURLs,
+                    outputDirectory: outputDirectory,
+                    stem: stem,
+                    setId: setId,
+                    setLabel: label,
+                    dataMedia: media,
+                    created: created,
+                    recoveryCount: recoveryCount
+                )
+                recoveryURLs = recs
+                writtenURLs.append(contentsOf: recs)
+            }
+
+            _ = count
+            return SpanResult(
+                setId: setId,
+                discURLs: discURLs,
+                totalFiles: files.count,
+                totalBytes: totalBytes,
+                chunkedFiles: chunkedFiles,
+                emptyDirectories: emptyDirs.count,
+                media: media,
+                recoveryURLs: recoveryURLs
+            )
         } catch {
             // Remove any partial numbered set so the destination is not left half-written.
             for url in writtenURLs {
@@ -601,17 +719,602 @@ enum SpanSet {
             }
             throw error
         }
+    }
 
-        _ = count
-        return SpanResult(
+    // MARK: - Recovery discs (XOR m=1, Reed–Solomon m≥2)
+
+    /// Write recovery disc(s).
+    /// - **m = 1:** classic XOR (`DISKETTE-SPAN-RECOVERY/1`) — rebuild any **one** lost data disc.
+    /// - **m ≥ 2:** Cauchy Reed–Solomon (`…/2`) — rebuild any **m** lost data discs.
+    private static func writeRecoveryDiscs(
+        dataDiscURLs: [URL],
+        outputDirectory: URL,
+        stem: String,
+        setId: String,
+        setLabel: String,
+        dataMedia: DisketteEngine.Media,
+        created: String,
+        recoveryCount m: Int
+    ) throws -> [URL] {
+        guard !dataDiscURLs.isEmpty else {
+            throw SpanError.cannotWrite("No data discs for recovery parity")
+        }
+        guard m >= 1, m <= maxRecoveryDiscs else {
+            throw SpanError.cannotWrite("recovery disc count must be 1…\(maxRecoveryDiscs)")
+        }
+
+        if m == 1 {
+            let url = try writeXorRecoveryDisc(
+                dataDiscURLs: dataDiscURLs,
+                outputDirectory: outputDirectory,
+                stem: stem,
+                setId: setId,
+                setLabel: setLabel,
+                dataMedia: dataMedia,
+                created: created
+            )
+            return [url]
+        }
+
+        return try writeReedSolomonRecoveryDiscs(
+            dataDiscURLs: dataDiscURLs,
+            outputDirectory: outputDirectory,
+            stem: stem,
             setId: setId,
-            discURLs: discURLs,
-            totalFiles: files.count,
-            totalBytes: totalBytes,
-            chunkedFiles: chunkedFiles,
-            emptyDirectories: emptyDirs.count,
-            media: media
+            setLabel: setLabel,
+            dataMedia: dataMedia,
+            created: created,
+            recoveryCount: m
         )
+    }
+
+    private static func writeXorRecoveryDisc(
+        dataDiscURLs: [URL],
+        outputDirectory: URL,
+        stem: String,
+        setId: String,
+        setLabel: String,
+        dataMedia: DisketteEngine.Media,
+        created: String
+    ) throws -> URL {
+        let (parity, lengths, crcs) = try computeXorParity(of: dataDiscURLs)
+        let parityCrc = DisketteEngine.crc32(parity)
+        let filenames = dataDiscURLs.map(\.lastPathComponent)
+        let recName = recoveryFilename(stem: stem, index: 1, count: 1)
+
+        let recoveryManifest = RecoveryManifest(
+            magic: recoveryMagicV1,
+            setId: setId,
+            setLabel: setLabel,
+            media: dataMedia.rawValue,
+            discCount: dataDiscURLs.count,
+            parityByteLength: parity.count,
+            dataDiscFilenames: filenames,
+            dataDiscByteLengths: lengths,
+            dataDiscCrc32: crcs,
+            parityCrc32: parityCrc,
+            created: created,
+            scheme: RecoveryScheme.xor.rawValue,
+            recoveryCount: 1,
+            recoveryIndex: 1,
+            recoveryDiscFilenames: [recName],
+            allParityCrc32: [parityCrc]
+        )
+        return try saveRecoveryVolume(
+            manifest: recoveryManifest,
+            parity: parity,
+            outputDirectory: outputDirectory,
+            filename: recName,
+            setLabel: setLabel,
+            recoveryIndex: 1,
+            recoveryCount: 1
+        )
+    }
+
+    private static func writeReedSolomonRecoveryDiscs(
+        dataDiscURLs: [URL],
+        outputDirectory: URL,
+        stem: String,
+        setId: String,
+        setLabel: String,
+        dataMedia: DisketteEngine.Media,
+        created: String,
+        recoveryCount m: Int
+    ) throws -> [URL] {
+        var lengths: [Int] = []
+        var crcs: [UInt32] = []
+        var maxLen = 0
+        for url in dataDiscURLs {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            let len = (attrs[.size] as? NSNumber)?.intValue ?? 0
+            lengths.append(len)
+            maxLen = max(maxLen, len)
+            crcs.append(try DisketteEngine.crc32File(at: url, bufferSize: streamBufferSize))
+        }
+
+        let parities = try CauchyReedSolomon.encodeParityFiles(
+            dataURLs: dataDiscURLs,
+            length: maxLen,
+            parityCount: m,
+            bufferSize: streamBufferSize
+        )
+        let parityCrcs = parities.map { DisketteEngine.crc32($0) }
+        let dataNames = dataDiscURLs.map(\.lastPathComponent)
+        let recNames = (1...m).map { recoveryFilename(stem: stem, index: $0, count: m) }
+
+        var urls: [URL] = []
+        for j in 0..<m {
+            let man = RecoveryManifest(
+                magic: recoveryMagicV2,
+                setId: setId,
+                setLabel: setLabel,
+                media: dataMedia.rawValue,
+                discCount: dataDiscURLs.count,
+                parityByteLength: maxLen,
+                dataDiscFilenames: dataNames,
+                dataDiscByteLengths: lengths,
+                dataDiscCrc32: crcs,
+                parityCrc32: parityCrcs[j],
+                created: created,
+                scheme: RecoveryScheme.reedSolomon.rawValue,
+                recoveryCount: m,
+                recoveryIndex: j + 1,
+                recoveryDiscFilenames: recNames,
+                allParityCrc32: parityCrcs
+            )
+            let url = try saveRecoveryVolume(
+                manifest: man,
+                parity: parities[j],
+                outputDirectory: outputDirectory,
+                filename: recNames[j],
+                setLabel: setLabel,
+                recoveryIndex: j + 1,
+                recoveryCount: m
+            )
+            urls.append(url)
+        }
+        return urls
+    }
+
+    private static func recoveryFilename(stem: String, index: Int, count: Int) -> String {
+        let width = max(2, String(count).count)
+        let idx = String(format: "%0\(width)d", index)
+        let total = String(format: "%0\(width)d", count)
+        return "\(stem)-Recovery-\(idx)of\(total).\(DisketteEngine.fileExtension)"
+    }
+
+    private static func saveRecoveryVolume(
+        manifest: RecoveryManifest,
+        parity: Data,
+        outputDirectory: URL,
+        filename: String,
+        setLabel: String,
+        recoveryIndex: Int,
+        recoveryCount: Int
+    ) throws -> URL {
+        let manData = try JSONEncoder().encode(manifest)
+        let need = parity.count + manData.count + 4_096
+        let recoveryMedia = try mediaFitting(minimumPayload: need)
+        let suffix = recoveryCount > 1 ? " R\(recoveryIndex)/\(recoveryCount)" : " REC"
+        let volume = DisketteEngine.create(
+            label: String((setLabel + suffix).prefix(32)),
+            media: recoveryMedia
+        )
+        volume.packaging = .binary
+        volume.compressOnWrite = false
+        try volume.addDirectory(at: "/.diskette-span")
+        try volume.addDirectory(at: "/.diskette-span/recovery")
+        if manData.count + parity.count > volume.freeBytes {
+            throw SpanError.cannotWrite(
+                "Recovery disc capacity too small for parity (\(parity.count) B) on \(recoveryMedia.shortName)"
+            )
+        }
+        try volume.addFile(at: recoveryManifestPath, data: manData, overwrite: true)
+        try volume.addFile(at: recoveryParityPath, data: parity, overwrite: true)
+        let url = outputDirectory.appendingPathComponent(filename)
+        try DisketteEngine.save(volume, to: url)
+        return url
+    }
+
+    /// Smallest media whose capacity can hold `minimumPayload` bytes of file data.
+    private static func mediaFitting(minimumPayload: Int) throws -> DisketteEngine.Media {
+        let ordered = DisketteEngine.Media.allCases.sorted { $0.capacity < $1.capacity }
+        if let m = ordered.first(where: { $0.capacity >= minimumPayload }) {
+            return m
+        }
+        let maxCap = ordered.last?.capacity ?? 0
+        throw SpanError.cannotWrite(
+            "Parity (\(minimumPayload) B) exceeds largest media capacity (\(maxCap) B); cannot create one recovery disc"
+        )
+    }
+
+    /// XOR of raw on-disk `.Floppy` bytes, zero-padded to the longest file.
+    private static func computeXorParity(of urls: [URL]) throws -> (Data, [Int], [UInt32]) {
+        var lengths: [Int] = []
+        var crcs: [UInt32] = []
+        var maxLen = 0
+        for url in urls {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            let len = (attrs[.size] as? NSNumber)?.intValue ?? 0
+            lengths.append(len)
+            maxLen = max(maxLen, len)
+            crcs.append(try DisketteEngine.crc32File(at: url, bufferSize: streamBufferSize))
+        }
+        var parity = Data(count: maxLen)
+        let bufSize = streamBufferSize
+        for url in urls {
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            var offset = 0
+            while offset < maxLen {
+                let toRead = min(bufSize, maxLen - offset)
+                let chunk = try handle.read(upToCount: toRead) ?? Data()
+                if chunk.isEmpty { break } // remainder is zero pad → XOR no-op
+                parity.withUnsafeMutableBytes { dest in
+                    guard let dBase = dest.bindMemory(to: UInt8.self).baseAddress else { return }
+                    chunk.withUnsafeBytes { src in
+                        guard let sBase = src.bindMemory(to: UInt8.self).baseAddress else { return }
+                        for i in 0..<chunk.count {
+                            dBase[offset + i] ^= sBase[i]
+                        }
+                    }
+                }
+                offset += chunk.count
+            }
+        }
+        return (parity, lengths, crcs)
+    }
+
+    static func readRecoveryManifest(from volume: DisketteEngine.Volume) throws -> RecoveryManifest? {
+        guard let entry = volume.entry(at: recoveryManifestPath), !entry.isDirectory else {
+            return nil
+        }
+        let data = try volume.readFile(at: recoveryManifestPath)
+        let man = try JSONDecoder().decode(RecoveryManifest.self, from: data)
+        guard man.isValidMagic else { return nil }
+        return man
+    }
+
+    static func isRecoveryVolume(_ volume: DisketteEngine.Volume) -> Bool {
+        (try? readRecoveryManifest(from: volume)) != nil
+    }
+
+    /// Reconstruct missing data disc(s) using recovery disc(s) + surviving data discs.
+    ///
+    /// - **XOR (1 recovery disc):** rebuilds exactly one missing data disc.
+    /// - **Reed–Solomon (m recovery discs):** rebuilds up to **m** missing data discs.
+    ///
+    /// `availableDiscURLs` may include a mix of data discs, recovery discs, and folders
+    /// are not expanded here (caller expands). Writes rebuilt files into `outputURL`
+    /// when it is a directory; for a single XOR rebuild a concrete `.Floppy` path is also allowed.
+    static func reconstructMissingDiscs(
+        availableDiscURLs: [URL],
+        outputURL: URL
+    ) throws -> RecoverBatchResult {
+        // Partition recovery vs data candidates (dedupe paths — callers may pass recovery twice).
+        var seen = Set<String>()
+        let uniqueURLs = availableDiscURLs.filter { url in
+            let key = url.standardizedFileURL.path
+            if seen.contains(key) { return false }
+            seen.insert(key)
+            return true
+        }
+
+        var recoveryByIndex: [Int: (url: URL, man: RecoveryManifest, parity: Data)] = [:]
+        var dataCandidates: [URL] = []
+        var sampleMan: RecoveryManifest?
+
+        for url in uniqueURLs {
+            guard DisketteEngine.isFloppyFilename(url) else { continue }
+            let vol = try DisketteEngine.load(from: url)
+            if let man = try readRecoveryManifest(from: vol) {
+                let parity = try vol.readFile(at: recoveryParityPath)
+                guard parity.count == man.parityByteLength else {
+                    throw SpanError.recoveryFailed(
+                        "Parity length \(parity.count) != manifest \(man.parityByteLength) on \(url.lastPathComponent)"
+                    )
+                }
+                let pCrc = DisketteEngine.crc32(parity)
+                guard pCrc == man.parityCrc32 else {
+                    throw SpanError.recoveryFailed("Recovery parity CRC mismatch: \(url.lastPathComponent)")
+                }
+                let idx = man.resolvedRecoveryIndex
+                if recoveryByIndex[idx] != nil {
+                    throw SpanError.recoveryAmbiguous("Duplicate recovery disc index \(idx)")
+                }
+                recoveryByIndex[idx] = (url, man, parity)
+                sampleMan = man
+            } else {
+                dataCandidates.append(url)
+            }
+        }
+
+        guard let man0 = sampleMan, !recoveryByIndex.isEmpty else {
+            throw SpanError.notARecoveryDisc("(no recovery disc in selection)")
+        }
+
+        // All recovery discs must share setId / scheme
+        for (_, item) in recoveryByIndex {
+            if item.man.setId != man0.setId {
+                throw SpanError.recoveryAmbiguous("Recovery discs belong to different span sets")
+            }
+            if item.man.resolvedScheme != man0.resolvedScheme {
+                throw SpanError.recoveryAmbiguous("Mixed recovery schemes in selection")
+            }
+        }
+
+        let man = man0
+        guard man.discCount == man.dataDiscFilenames.count,
+              man.discCount == man.dataDiscByteLengths.count,
+              man.discCount == man.dataDiscCrc32.count else {
+            throw SpanError.recoveryFailed("Recovery manifest arrays inconsistent")
+        }
+
+        let byName = try mapAvailableDataDiscs(
+            dataCandidates: dataCandidates,
+            man: man,
+            recoveryURLs: Set(recoveryByIndex.values.map { $0.url.standardizedFileURL })
+        )
+
+        let missingIndices = man.dataDiscFilenames.indices.filter { byName[man.dataDiscFilenames[$0]] == nil }
+        if missingIndices.isEmpty {
+            throw SpanError.recoveryAmbiguous(
+                "No missing data disc — all \(man.discCount) data discs appear present."
+            )
+        }
+
+        let m = man.resolvedRecoveryCount
+        if missingIndices.count > m {
+            let names = missingIndices.map { man.dataDiscFilenames[$0] }.joined(separator: ", ")
+            throw SpanError.recoveryAmbiguous(
+                "Too many missing data discs (\(names)): this set can rebuild at most \(m)."
+            )
+        }
+
+        switch man.resolvedScheme {
+        case .xor:
+            guard m == 1, recoveryByIndex.count >= 1 else {
+                throw SpanError.recoveryFailed("XOR recovery requires one recovery disc")
+            }
+            guard missingIndices.count == 1 else {
+                throw SpanError.recoveryAmbiguous(
+                    "XOR recovery rebuilds only one loss; missing \(missingIndices.count) discs. Use Reed–Solomon recovery discs for multi-loss."
+                )
+            }
+            let parity = recoveryByIndex.values.first!.parity
+            let result = try rebuildXorDisc(
+                man: man,
+                missing: missingIndices[0],
+                byName: byName,
+                parity: parity,
+                outputURL: outputURL
+            )
+            return RecoverBatchResult(setId: man.setId, scheme: .xor, results: [result])
+
+        case .reedSolomon:
+            let results = try rebuildReedSolomonDiscs(
+                man: man,
+                missingIndices: Array(missingIndices),
+                byName: byName,
+                recoveryByIndex: recoveryByIndex,
+                outputDirectory: outputDirectoryForRecovery(outputURL)
+            )
+            return RecoverBatchResult(setId: man.setId, scheme: .reedSolomon, results: results)
+        }
+    }
+
+    /// Convenience for single-disc XOR (or RS with one missing): same as `reconstructMissingDiscs`.
+    static func reconstructMissingDisc(
+        recoveryURL: URL,
+        availableDiscURLs: [URL],
+        outputURL: URL
+    ) throws -> RecoverResult {
+        let batch = try reconstructMissingDiscs(
+            availableDiscURLs: availableDiscURLs + [recoveryURL],
+            outputURL: outputURL
+        )
+        guard let first = batch.results.first else {
+            throw SpanError.recoveryFailed("No discs reconstructed")
+        }
+        return first
+    }
+
+    private static func mapAvailableDataDiscs(
+        dataCandidates: [URL],
+        man: RecoveryManifest,
+        recoveryURLs: Set<URL>
+    ) throws -> [String: URL] {
+        var byName: [String: URL] = [:]
+        for url in dataCandidates {
+            if recoveryURLs.contains(url.standardizedFileURL) { continue }
+            let name = url.lastPathComponent
+            if man.dataDiscFilenames.contains(name) {
+                if byName[name] != nil {
+                    throw SpanError.recoveryAmbiguous("Duplicate available disc: \(name)")
+                }
+                byName[name] = url
+                continue
+            }
+            if DisketteEngine.isFloppyFilename(url),
+               let vol = try? DisketteEngine.load(from: url),
+               !isRecoveryVolume(vol),
+               let sm = try? readManifest(from: vol),
+               sm.setId == man.setId,
+               sm.index >= 1, sm.index <= man.dataDiscFilenames.count {
+                let expected = man.dataDiscFilenames[sm.index - 1]
+                if byName[expected] == nil {
+                    byName[expected] = url
+                }
+            }
+        }
+        return byName
+    }
+
+    private static func outputDirectoryForRecovery(_ outputURL: URL) throws -> URL {
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: outputURL.path, isDirectory: &isDir), isDir.boolValue {
+            return outputURL
+        }
+        if outputURL.pathExtension.lowercased() == DisketteEngine.fileExtension.lowercased() {
+            return outputURL.deletingLastPathComponent()
+        }
+        try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
+        return outputURL
+    }
+
+    private static func resolveOutputFile(outputURL: URL, missingName: String) throws -> URL {
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: outputURL.path, isDirectory: &isDir), isDir.boolValue {
+            return outputURL.appendingPathComponent(missingName)
+        }
+        if outputURL.pathExtension.lowercased() == DisketteEngine.fileExtension.lowercased()
+            || outputURL.lastPathComponent.lowercased().hasSuffix(".\(DisketteEngine.fileExtension.lowercased())") {
+            return outputURL
+        }
+        try FileManager.default.createDirectory(at: outputURL, withIntermediateDirectories: true)
+        return outputURL.appendingPathComponent(missingName)
+    }
+
+    private static func rebuildXorDisc(
+        man: RecoveryManifest,
+        missing: Int,
+        byName: [String: URL],
+        parity: Data,
+        outputURL: URL
+    ) throws -> RecoverResult {
+        let missingName = man.dataDiscFilenames[missing]
+        let expectedLen = man.dataDiscByteLengths[missing]
+        let expectedCrc = man.dataDiscCrc32[missing]
+
+        var rebuilt = Data(parity)
+        for (i, name) in man.dataDiscFilenames.enumerated() where i != missing {
+            guard let url = byName[name] else {
+                throw SpanError.recoveryFailed("Internal: missing available disc \(name)")
+            }
+            try xorFile(at: url, into: &rebuilt)
+        }
+        guard expectedLen <= rebuilt.count else {
+            throw SpanError.recoveryFailed("Expected length \(expectedLen) exceeds parity block \(rebuilt.count)")
+        }
+        rebuilt = Data(rebuilt.prefix(expectedLen))
+        let gotCrc = DisketteEngine.crc32(rebuilt)
+        guard gotCrc == expectedCrc else {
+            throw SpanError.recoveryFailed(
+                "Rebuilt \(missingName) CRC mismatch (got \(String(gotCrc, radix: 16)), expected \(String(expectedCrc, radix: 16)))"
+            )
+        }
+        let dest = try resolveOutputFile(outputURL: outputURL, missingName: missingName)
+        if FileManager.default.fileExists(atPath: dest.path) {
+            throw SpanError.destinationExists(dest.path)
+        }
+        try rebuilt.write(to: dest, options: .atomic)
+        return RecoverResult(
+            setId: man.setId,
+            reconstructedURL: dest,
+            missingIndex: missing + 1,
+            missingFilename: missingName,
+            byteLength: expectedLen
+        )
+    }
+
+    private static func rebuildReedSolomonDiscs(
+        man: RecoveryManifest,
+        missingIndices: [Int],
+        byName: [String: URL],
+        recoveryByIndex: [Int: (url: URL, man: RecoveryManifest, parity: Data)],
+        outputDirectory: URL
+    ) throws -> [RecoverResult] {
+        let n = man.discCount
+        let m = man.resolvedRecoveryCount
+        let length = man.parityByteLength
+        let rs: CauchyReedSolomon
+        do {
+            rs = try CauchyReedSolomon(dataCount: n, parityCount: m)
+        } catch {
+            throw SpanError.recoveryFailed(error.localizedDescription)
+        }
+
+        // Load known data fully (padded conceptually; decoder reads short as 0)
+        var knownData: [Int: Data] = [:]
+        for i in 0..<n where !missingIndices.contains(i) {
+            guard let url = byName[man.dataDiscFilenames[i]] else {
+                throw SpanError.recoveryFailed("Missing available data disc \(man.dataDiscFilenames[i])")
+            }
+            knownData[i] = try Data(contentsOf: url)
+        }
+
+        var knownParity: [Int: Data] = [:]
+        for (idx, item) in recoveryByIndex {
+            // recoveryIndex is 1-based
+            knownParity[idx - 1] = item.parity
+        }
+
+        let recovered: [Int: Data]
+        do {
+            recovered = try rs.recoverMissingData(
+                knownData: knownData,
+                knownParity: knownParity,
+                missingData: missingIndices,
+                length: length
+            )
+        } catch {
+            throw SpanError.recoveryFailed(error.localizedDescription)
+        }
+
+        var results: [RecoverResult] = []
+        for mi in missingIndices.sorted() {
+            guard var rebuilt = recovered[mi] else {
+                throw SpanError.recoveryFailed("RS did not return disc index \(mi)")
+            }
+            let expectedLen = man.dataDiscByteLengths[mi]
+            let expectedCrc = man.dataDiscCrc32[mi]
+            let missingName = man.dataDiscFilenames[mi]
+            guard expectedLen <= rebuilt.count else {
+                throw SpanError.recoveryFailed("RS rebuilt length short for \(missingName)")
+            }
+            rebuilt = Data(rebuilt.prefix(expectedLen))
+            let gotCrc = DisketteEngine.crc32(rebuilt)
+            guard gotCrc == expectedCrc else {
+                throw SpanError.recoveryFailed(
+                    "Rebuilt \(missingName) CRC mismatch (got \(String(gotCrc, radix: 16)), expected \(String(expectedCrc, radix: 16)))"
+                )
+            }
+            let dest = outputDirectory.appendingPathComponent(missingName)
+            if FileManager.default.fileExists(atPath: dest.path) {
+                throw SpanError.destinationExists(dest.path)
+            }
+            try rebuilt.write(to: dest, options: .atomic)
+            results.append(RecoverResult(
+                setId: man.setId,
+                reconstructedURL: dest,
+                missingIndex: mi + 1,
+                missingFilename: missingName,
+                byteLength: expectedLen
+            ))
+        }
+        return results
+    }
+
+    /// XOR file contents into `buffer` (file may be shorter; remainder of buffer unchanged = pad 0).
+    private static func xorFile(at url: URL, into buffer: inout Data) throws {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var offset = 0
+        let limit = buffer.count
+        while offset < limit {
+            let chunk = try handle.read(upToCount: min(streamBufferSize, limit - offset)) ?? Data()
+            if chunk.isEmpty { break }
+            buffer.withUnsafeMutableBytes { dest in
+                guard let dBase = dest.bindMemory(to: UInt8.self).baseAddress else { return }
+                chunk.withUnsafeBytes { src in
+                    guard let sBase = src.bindMemory(to: UInt8.self).baseAddress else { return }
+                    for i in 0..<chunk.count {
+                        dBase[offset + i] ^= sBase[i]
+                    }
+                }
+            }
+            offset += chunk.count
+        }
     }
 
     private static func partSort(_ a: SpanPart, _ b: SpanPart) -> Bool {
@@ -639,11 +1342,16 @@ enum SpanSet {
         var refs: [DiscRef] = []
         for url in discURLs {
             let vol = try DisketteEngine.load(from: url)
+            // Ignore optional XOR recovery discs mixed into a multi-select / folder.
+            if isRecoveryVolume(vol) { continue }
             guard let man = try readManifest(from: vol) else {
                 throw SpanError.notASpanDisc(url.lastPathComponent)
             }
             refs.append(DiscRef(url: url, manifest: man))
             // volume released at end of iteration
+        }
+        guard !refs.isEmpty else {
+            throw SpanError.notASpanDisc("(no span data discs in selection)")
         }
 
         let setIds = Set(refs.map(\.manifest.setId))
@@ -1160,6 +1868,100 @@ enum SpanSet {
             // Incremental CRC matches whole-file CRC
             let crcFile = try DisketteEngine.crc32File(at: restored2.appendingPathComponent("huge/big.bin"))
             if crcFile != DisketteEngine.crc32(huge) { return "streaming crc mismatch" }
+
+            // Optional single-disc XOR recovery
+            let recFolder = tmp.appendingPathComponent("rec-src", isDirectory: true)
+            try fm.createDirectory(at: recFolder, withIntermediateDirectories: true)
+            for i in 0..<6 {
+                try Data(repeating: UInt8(0x40 + i), count: 80_000)
+                    .write(to: recFolder.appendingPathComponent("b\(i).bin"))
+            }
+            let recOut = tmp.appendingPathComponent("rec-discs", isDirectory: true)
+            let recSpan = try spanFolder(
+                at: recFolder,
+                outputDirectory: recOut,
+                media: .dd360,
+                setLabel: "DontCopy",
+                packaging: .binary,
+                compress: false,
+                recoveryDiscCount: 1
+            )
+            guard let recoveryURL = recSpan.recoveryURL else { return "expected recovery disc" }
+            if recSpan.discURLs.count < 2 { return "recovery test needs multi-disc" }
+            let victim = recSpan.discURLs[recSpan.discURLs.count / 2]
+            let victimBytes = try Data(contentsOf: victim)
+            try fm.removeItem(at: victim)
+            let remaining = recSpan.discURLs.filter { $0 != victim } + [recoveryURL]
+            let rebuiltDir = tmp.appendingPathComponent("rebuilt", isDirectory: true)
+            try fm.createDirectory(at: rebuiltDir, withIntermediateDirectories: true)
+            let recovered = try reconstructMissingDisc(
+                recoveryURL: recoveryURL,
+                availableDiscURLs: remaining,
+                outputURL: rebuiltDir
+            )
+            let rebuiltBytes = try Data(contentsOf: recovered.reconstructedURL)
+            if rebuiltBytes != victimBytes { return "recovery XOR mismatch" }
+            let allDiscs = recSpan.discURLs.map { url -> URL in
+                url == victim ? recovered.reconstructedURL : url
+            }
+            let recRestored = tmp.appendingPathComponent("rec-restored", isDirectory: true)
+            let recU = try unspan(discURLs: allDiscs, outputDirectory: recRestored, collision: .overwrite)
+            if recU.filesRestored != 6 { return "recovery unspan \(recU.filesRestored)" }
+
+            // Reed–Solomon multi-loss (2 recovery discs → rebuild 2 missing data discs)
+            let rsFolder = tmp.appendingPathComponent("rs-src", isDirectory: true)
+            try fm.createDirectory(at: rsFolder, withIntermediateDirectories: true)
+            for i in 0..<12 {
+                var payload = Data(count: 90_000)
+                for b in 0..<payload.count { payload[b] = UInt8((i * 31 + b * 17) & 0xFF) }
+                try payload.write(to: rsFolder.appendingPathComponent("r\(i).bin"))
+            }
+            let rsOut = tmp.appendingPathComponent("rs-discs", isDirectory: true)
+            let rsSpan = try spanFolder(
+                at: rsFolder,
+                outputDirectory: rsOut,
+                media: .dd360,
+                setLabel: "RSSet",
+                packaging: .binary,
+                compress: false,
+                recoveryDiscCount: 2
+            )
+            if rsSpan.recoveryURLs.count != 2 { return "expected 2 RS recovery discs, got \(rsSpan.recoveryURLs.count)" }
+            if rsSpan.discURLs.count < 3 { return "RS needs ≥3 data discs, got \(rsSpan.discURLs.count)" }
+            let v1 = rsSpan.discURLs[0]
+            let v2 = rsSpan.discURLs[rsSpan.discURLs.count - 1]
+            let v1Bytes = try Data(contentsOf: v1)
+            let v2Bytes = try Data(contentsOf: v2)
+            try fm.removeItem(at: v1)
+            try fm.removeItem(at: v2)
+            let rsAvail = rsSpan.discURLs.filter { $0 != v1 && $0 != v2 } + rsSpan.recoveryURLs
+            let rsRebuiltDir = tmp.appendingPathComponent("rs-rebuilt", isDirectory: true)
+            try fm.createDirectory(at: rsRebuiltDir, withIntermediateDirectories: true)
+            let rsBatch = try reconstructMissingDiscs(availableDiscURLs: rsAvail, outputURL: rsRebuiltDir)
+            if rsBatch.scheme != .reedSolomon { return "expected RS scheme" }
+            if rsBatch.results.count != 2 { return "RS rebuilt \(rsBatch.results.count), want 2" }
+            for r in rsBatch.results {
+                let data = try Data(contentsOf: r.reconstructedURL)
+                if r.missingFilename == v1.lastPathComponent {
+                    if data != v1Bytes { return "RS rebuild mismatch disc1" }
+                } else if r.missingFilename == v2.lastPathComponent {
+                    if data != v2Bytes { return "RS rebuild mismatch disc2" }
+                } else {
+                    return "unexpected rebuilt name \(r.missingFilename)"
+                }
+            }
+            let rsAll = rsSpan.discURLs.map { url -> URL in
+                if url == v1 {
+                    return rsBatch.results.first { $0.missingFilename == v1.lastPathComponent }!.reconstructedURL
+                }
+                if url == v2 {
+                    return rsBatch.results.first { $0.missingFilename == v2.lastPathComponent }!.reconstructedURL
+                }
+                return url
+            }
+            let rsRestored = tmp.appendingPathComponent("rs-restored", isDirectory: true)
+            let rsU = try unspan(discURLs: rsAll, outputDirectory: rsRestored, collision: .overwrite)
+            if rsU.filesRestored != 12 { return "RS unspan \(rsU.filesRestored)" }
 
         } catch {
             return "span self-test: \(error.localizedDescription)"

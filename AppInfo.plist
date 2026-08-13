@@ -19,11 +19,11 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.5.8</string>
+    <string>1.6.0</string>
     <key>CFBundleVersion</key>
-    <string>16</string>
+    <string>18</string>
     <key>CFBundleGetInfoString</key>
-    <string>Diskette 1.5.8</string>
+    <string>Diskette 1.6.0</string>
     <key>UTExportedTypeDeclarations</key>
     <array>
         <dict>

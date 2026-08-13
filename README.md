@@ -1,6 +1,6 @@
 # Diskette
 
-**Version 1.5.8** · macOS 13+
+**Version 1.6.0** · macOS 13+
 
 A native macOS app that stores data in **virtual floppy disc containers** (`.Floppy`). Containers **open inside the app** — browse, add, extract, and delete files without mounting an image in Finder. Large folders can be **spanned** across multiple discs with **chunking** and **streaming** I/O.
 
@@ -16,6 +16,7 @@ Same family of purpose as PaperTape, Phonograph, and Parchment: an obscure porta
 | Folder trees | Import/export preserves nested folders |
 | Layout repair | **Opt-in only** — Repair Layout… / `--repair-layout` (join-bug heuristic) |
 | **Span** | Multi-disc sets; files that don’t fit are **chunked** |
+| **Recovery discs** | Optional XOR (1 loss) or Reed–Solomon (up to N losses) |
 | **Streaming** | Span/restore stream from disk — not all host files in RAM |
 | Empty dirs | Preserved across span/restore |
 | Hidden files | **Skipped** on span (`.skipsHiddenFiles`) |
@@ -51,6 +52,7 @@ This is **packaging / storage**, not encryption.
 - A failed span deletes any **partial** `*-NNofMM.Floppy` files it wrote  
 - **Span complete** summary truncates long disc lists (first / last + count) so large sets stay on-screen  
 - Span planner leaves room for a **large manifest** when a disc holds many small files (not just a fixed headroom)  
+- Optional **recovery discs**: 1× XOR (any **one** loss) or N× Reed–Solomon (up to **N** losses); `*-Recovery-JJofNN.Floppy`  
 
 ### Packaging
 
@@ -65,8 +67,9 @@ This is **packaging / storage**, not encryption.
 
 - If the directory still loads, extract normally; **CRC-32** shows which files are intact.
 - A broken header may still leave **uncompressed** payloads carvable by type signatures; **zlib** records need directory metadata for boundaries.
-- Span restore needs intact manifests; a **missing disc** cannot be rebuilt (no parity / PAR2 in the format today).
-- Details: [FORMAT.md — Damage recovery](FORMAT.md#damage-recovery).
+- Span restore needs intact manifests. Without recovery discs, a **missing disc** cannot be rebuilt.
+- Optional **recovery discs** at span time: **1× XOR** (any one loss) or **N× Reed–Solomon** (up to N losses).
+- Details: [FORMAT.md — Damage recovery](FORMAT.md#damage-recovery) and [recovery discs](FORMAT.md#optional-recovery-discs).
 
 ## Build & run
 
@@ -86,6 +89,7 @@ Requires macOS 13+ and Swift 5.9+ (Xcode toolchain).
 | New blank disc | **New Disc** (confirms if one is already mounted) |
 | Open disc | **Open…**, double-click `.Floppy`, or drop a disc |
 | Span large folder | **Span Folder…** or drop a folder with no disc mounted |
+| Recovery discs | Span dialog: **None / 1 XOR / 2–8 Reed–Solomon**; **Recover Missing Disc…** after losses |
 | Restore span set | **Restore Set…** → all discs or a folder of discs |
 | Add files | Drop onto window or **Add…** in the browser |
 | Extract | Select items → **Extract…** (keeps folder structure) |
@@ -112,9 +116,14 @@ swift run Diskette --self-test
 
 # Span / unspan
 .build/release/Diskette --span ./BigFolder -o ~/Discs --media 1.44 --label "Backup"
+.build/release/Diskette --span ./BigFolder -o ~/Discs --media 1.44 --with-recovery
+.build/release/Diskette --span ./BigFolder -o ~/Discs --media 1.44 --recovery-discs 3
 .build/release/Diskette --unspan-dir ~/Discs -o ~/Restored
 .build/release/Diskette --unspan-dir ~/Discs -o ~/Restored --force
 .build/release/Diskette --unspan-dir ~/Discs -o ~/Restored --skip-existing
+
+# Rebuild missing data disc(s) from Recovery + survivors (XOR or Reed–Solomon)
+.build/release/Diskette --recover-disc ~/Discs -o ~/Discs
 
 # Open GUI with a disc
 .build/release/Diskette ~/Discs/Backup-01of03.Floppy
